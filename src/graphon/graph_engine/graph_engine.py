@@ -374,7 +374,10 @@ class GraphEngine:
             self._state_manager.start_execution(root_node.id)
         else:
             seen_nodes: set[str] = set()
-            for node_id in paused_nodes + deferred_nodes:
+            # Paused/deferred nodes are the clean-pause frontier; crash-resume must
+            # additionally recover nodes that were mid-execution when the worker died
+            # (#192). See _recover_incomplete_nodes for why those are otherwise lost.
+            for node_id in paused_nodes + deferred_nodes + self._recover_incomplete_nodes():
                 if node_id in seen_nodes:
                     continue
                 seen_nodes.add(node_id)
@@ -383,6 +386,41 @@ class GraphEngine:
 
         # Start dispatcher
         self._dispatcher.start()
+
+    def _recover_incomplete_nodes(self) -> list[str]:
+        """Find nodes that were reached but never completed (crash-resume, #192).
+
+        A worker that dies mid-node leaves that node tracked only in the in-memory
+        executing set, which is not part of the persisted snapshot — so on resume
+        neither the ready queue nor the paused/deferred sets contain it, the engine
+        sees no work, and it terminates the run early (succeeded, empty outputs).
+
+        A reached-but-incomplete node is one whose graph state is TAKEN but which has
+        not resolved its outgoing edges (non-terminal) or produced any outputs
+        (terminal). Re-running such a node from the last checkpoint is safe by design:
+        the tool/agent idempotency layer (#195/#198) suppresses duplicate side effects.
+        """
+        from graphon.enums import NodeState
+
+        incomplete: list[str] = []
+        for node_id in self._graph.nodes:
+            if self._state_manager.get_node_state(node_id) != NodeState.TAKEN:
+                continue
+            outgoing = self._graph.get_outgoing_edges(node_id)
+            if outgoing:
+                resolved = all(
+                    self._state_manager.get_edge_state(edge.id) != NodeState.UNKNOWN
+                    for edge in outgoing
+                )
+                if not resolved:
+                    incomplete.append(node_id)
+            else:
+                produced_outputs = bool(
+                    self._graph_runtime_state.variable_pool.variable_dictionary.get(node_id)
+                )
+                if not produced_outputs:
+                    incomplete.append(node_id)
+        return incomplete
 
     def _stop_execution(self) -> None:
         """Stop execution subsystems."""
