@@ -359,35 +359,56 @@ class GraphEngine:
             paused_nodes = self._graph_runtime_state.consume_paused_nodes()
             deferred_nodes = self._graph_runtime_state.consume_deferred_nodes()
 
-        # Start worker pool (it calculates initial workers internally)
-        self._worker_pool.start()
-
         # Register response nodes
         for node in self._graph.nodes.values():
             if node.execution_type == NodeExecutionType.RESPONSE:
                 self._response_coordinator.register(node.id)
 
+        # Seed the ready queue BEFORE starting the worker pool (#192). On resume the worker
+        # pool would otherwise begin draining the RESTORED ready queue immediately, so a
+        # node still queued at snapshot time (e.g. a parallel-branch sibling) could be pulled
+        # by a worker before _recover_incomplete_nodes reads the queue — making it look
+        # "executing-but-lost" and get re-enqueued, double-running it. Seeding first keeps the
+        # queue read consistent so each node is dispatched exactly once.
         if not resume:
             # Enqueue root node
             root_node = self._graph.root_node
             self._state_manager.enqueue_node(root_node.id)
             self._state_manager.start_execution(root_node.id)
         else:
-            seen_nodes: set[str] = set()
+            import json as _json
+
+            # Node ids restored directly into the ready queue from the snapshot (read now,
+            # before the worker pool starts, so it is intact and race-free).
+            try:
+                restored_queued = set(_json.loads(self._ready_queue.dumps()).get("items", []))
+            except Exception:
+                restored_queued = set()
+            # Mark restored-queue nodes as EXECUTING (#192). loads() puts them straight into
+            # the ready queue, bypassing start_execution, so they are absent from the
+            # executing set. Without this, when a sibling branch finishes, is_execution_complete
+            # (ready_queue empty AND executing == 0) fires while a restored branch is still
+            # queued/running — terminating the run early and abandoning the fan-in.
+            for node_id in restored_queued:
+                self._state_manager.start_execution(node_id)
+
+            seen_nodes: set[str] = set(restored_queued)
             # Paused/deferred nodes are the clean-pause frontier; crash-resume must
             # additionally recover nodes that were mid-execution when the worker died
             # (#192). See _recover_incomplete_nodes for why those are otherwise lost.
-            for node_id in paused_nodes + deferred_nodes + self._recover_incomplete_nodes():
+            for node_id in paused_nodes + deferred_nodes + self._recover_incomplete_nodes(restored_queued):
                 if node_id in seen_nodes:
                     continue
                 seen_nodes.add(node_id)
                 self._state_manager.enqueue_node(node_id)
                 self._state_manager.start_execution(node_id)
 
-        # Start dispatcher
+        # Start worker pool (it calculates initial workers internally) only after the queue
+        # is fully seeded, then the dispatcher.
+        self._worker_pool.start()
         self._dispatcher.start()
 
-    def _recover_incomplete_nodes(self) -> list[str]:
+    def _recover_incomplete_nodes(self, already_queued: set[str]) -> list[str]:
         """Find nodes that were reached but never completed (crash-resume, #192).
 
         A worker that dies mid-node leaves that node tracked only in the in-memory
@@ -399,11 +420,22 @@ class GraphEngine:
         not resolved its outgoing edges (non-terminal) or produced any outputs
         (terminal). Re-running such a node from the last checkpoint is safe by design:
         the tool/agent idempotency layer (#195/#198) suppresses duplicate side effects.
+
+        Nodes still present in the restored ready queue are EXCLUDED: they were queued
+        but not yet dispatched at snapshot time, so the dispatcher will run them exactly
+        once on its own. Re-enqueuing them here would dispatch a parallel fan-out
+        successor twice — and the second run would append to its already-closed output
+        stream (ValueError: stream already closed). Only nodes that were popped from the
+        queue and executing when the worker died (lost from the in-memory executing set,
+        and absent from the queue) need recovering. The dispatcher is not started until
+        after this runs, so reading the queue here is race-free.
         """
         from graphon.enums import NodeState
 
         incomplete: list[str] = []
         for node_id in self._graph.nodes:
+            if node_id in already_queued:
+                continue
             if self._state_manager.get_node_state(node_id) != NodeState.TAKEN:
                 continue
             outgoing = self._graph.get_outgoing_edges(node_id)
